@@ -1,7 +1,7 @@
 import json
 import sys
 from datetime import datetime
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import MagicMock, Mock, PropertyMock, patch
 
 import pytest
 
@@ -113,10 +113,15 @@ def test_collection_name_preserved_after_reset(mock_sqlite, mock_llm_factory, mo
     assert memory.collection_name == test_collection_name
     assert memory.config.vector_store.config.collection_name == test_collection_name
 
-    reset_calls = [call for call in mock_vector_factory.call_args_list if len(mock_vector_factory.call_args_list) > 2]
-    if reset_calls:
-        reset_config = reset_calls[-1][0][1]
-        assert reset_config.collection_name == test_collection_name, f"Reset used wrong collection name: {reset_config.collection_name}"
+    # The memory also builds vector stores for its auxiliary collections (entity,
+    # migrations), each from its own config object. The primary store is the one
+    # created from the config instance under test, so select on identity.
+    primary_calls = [call for call in mock_vector_factory.call_args_list if call[0][1] is config.vector_store.config]
+    assert primary_calls, "expected at least one primary-collection vector store creation"
+    reset_config = primary_calls[-1][0][1]
+    assert reset_config.collection_name == test_collection_name, (
+        f"Reset used wrong collection name: {reset_config.collection_name}"
+    )
 
 
 @patch('mem0.utils.factory.EmbedderFactory.create')
@@ -1501,6 +1506,220 @@ class TestAsyncDeleteAllEntityRace:
         mock_entity_store.delete.assert_called_once_with(vector_id="entity-alice")
 
         assert mock_vector_store.delete.call_count == 2
+
+
+class TestEntityCleanupFreshProcess:
+    """Entity cleanup must run in a process that has not initialized the entity store.
+
+    `entity_store` is a lazy property backed by `_entity_store`, which stays None
+    until something touches it. These tests never assign `_entity_store`, so they
+    exercise the state of a freshly constructed Memory/AsyncMemory whose first
+    call is a delete, update or reset.
+    """
+
+    @staticmethod
+    def _entity_row(linked_memory_ids):
+        row = MagicMock()
+        row.id = "entity-paris"
+        row.payload = {"data": "Paris", "user_id": "u1", "linked_memory_ids": list(linked_memory_ids)}
+        return row
+
+    @staticmethod
+    def _existing_memory():
+        mem = MagicMock()
+        mem.payload = {"data": "trip to Paris", "created_at": "2026-04-16T00:00:00+00:00", "user_id": "u1"}
+        return mem
+
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    def test_delete_updates_entity_when_other_memories_remain(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        """A delete must strip only its own id and leave the rest of the links intact."""
+        mock_embedder = MagicMock()
+        mock_embedder.embed.return_value = [0.1, 0.2, 0.3]
+        mock_embedder_factory.return_value = mock_embedder
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+        mock_vector_factory.return_value = MagicMock()
+
+        mock_entity_store = MagicMock()
+        mock_entity_store.list.return_value = ([self._entity_row(["mem-1", "mem-2"])],)
+
+        memory = Memory(MemoryConfig())
+        assert memory._entity_store is None
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.return_value = mock_entity_store
+            memory._delete_memory("mem-1", existing_memory=self._existing_memory())
+
+        mock_entity_store.update.assert_called_once()
+        payload = mock_entity_store.update.call_args.kwargs["payload"]
+        assert payload["linked_memory_ids"] == ["mem-2"]
+        mock_entity_store.delete.assert_not_called()
+
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    def test_delete_removes_entity_when_no_memories_remain(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        """An entity linked only to the deleted memory must be removed, not updated."""
+        mock_embedder_factory.return_value = MagicMock()
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+        mock_vector_factory.return_value = MagicMock()
+
+        mock_entity_store = MagicMock()
+        mock_entity_store.list.return_value = ([self._entity_row(["mem-1"])],)
+
+        memory = Memory(MemoryConfig())
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.return_value = mock_entity_store
+            memory._delete_memory("mem-1", existing_memory=self._existing_memory())
+
+        mock_entity_store.delete.assert_called_once_with(vector_id="entity-paris")
+        mock_entity_store.update.assert_not_called()
+
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    def test_delete_survives_entity_store_init_failure(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        """Resolving the entity store must never break the primary delete."""
+        mock_embedder_factory.return_value = MagicMock()
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+        mock_vector_store = MagicMock()
+        mock_vector_factory.return_value = mock_vector_store
+
+        memory = Memory(MemoryConfig())
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.side_effect = RuntimeError("entity collection unreachable")
+            assert memory._delete_memory("mem-1", existing_memory=self._existing_memory()) == "mem-1"
+
+        mock_vector_store.delete.assert_called_once_with(vector_id="mem-1")
+
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    def test_reset_clears_entity_store(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        """reset() wipes everything, so it must wipe entities it never initialized."""
+        mock_embedder_factory.return_value = MagicMock()
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+        mock_vector_factory.return_value = MagicMock()
+
+        mock_entity_store = MagicMock()
+        memory = Memory(MemoryConfig())
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.return_value = mock_entity_store
+            memory.reset()
+
+        mock_entity_store.reset.assert_called_once()
+        assert memory._entity_store is None
+
+    @pytest.mark.asyncio
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    async def test_async_delete_all_bulk_clears_entity_store(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        """delete_all skips per-memory cleanup, so the bulk clear is the only pass there is."""
+        mock_embedder_factory.return_value = MagicMock()
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+
+        mem_a = MagicMock()
+        mem_a.id = "mem-1"
+        mem_a.payload = {"data": "trip to Paris", "user_id": "u1"}
+        mock_vector_store = MagicMock()
+        mock_vector_store.list.side_effect = [([mem_a],), ([],)]
+        mock_vector_store.get.return_value = mem_a
+        mock_vector_factory.return_value = mock_vector_store
+
+        mock_entity_store = MagicMock()
+        mock_entity_store.list.return_value = ([self._entity_row(["mem-1"])],)
+
+        from mem0.memory.main import AsyncMemory
+
+        memory = AsyncMemory(MemoryConfig())
+        assert memory._entity_store is None
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.return_value = mock_entity_store
+            await memory.delete_all(user_id="u1")
+
+        mock_entity_store.delete.assert_called_once_with(vector_id="entity-paris")
+
+    @pytest.mark.asyncio
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    async def test_async_delete_cleans_entities(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        """Async single delete mirrors the sync path."""
+        mock_embedder = MagicMock()
+        mock_embedder.embed.return_value = [0.1, 0.2, 0.3]
+        mock_embedder_factory.return_value = mock_embedder
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+        mock_vector_factory.return_value = MagicMock()
+
+        mock_entity_store = MagicMock()
+        mock_entity_store.list.return_value = ([self._entity_row(["mem-1", "mem-2"])],)
+
+        from mem0.memory.main import AsyncMemory
+
+        memory = AsyncMemory(MemoryConfig())
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.return_value = mock_entity_store
+            await memory._delete_memory("mem-1", existing_memory=self._existing_memory())
+
+        payload = mock_entity_store.update.call_args.kwargs["payload"]
+        assert payload["linked_memory_ids"] == ["mem-2"]
+
+    @pytest.mark.asyncio
+    @patch("mem0.utils.factory.EmbedderFactory.create")
+    @patch("mem0.utils.factory.VectorStoreFactory.create")
+    @patch("mem0.utils.factory.LlmFactory.create")
+    @patch("mem0.memory.storage.SQLiteManager")
+    async def test_async_reset_clears_entity_store(
+        self, mock_sqlite, mock_llm_factory, mock_vector_factory, mock_embedder_factory
+    ):
+        mock_embedder_factory.return_value = MagicMock()
+        mock_llm_factory.return_value = MagicMock()
+        mock_sqlite.return_value = MagicMock()
+        mock_vector_factory.return_value = MagicMock()
+
+        mock_entity_store = MagicMock()
+
+        from mem0.memory.main import AsyncMemory
+
+        memory = AsyncMemory(MemoryConfig())
+
+        with patch.object(type(memory), "entity_store", new_callable=PropertyMock) as prop:
+            prop.return_value = mock_entity_store
+            await memory.reset()
+
+        mock_entity_store.reset.assert_called_once()
+        assert memory._entity_store is None
 
 
 @pytest.mark.asyncio
